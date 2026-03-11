@@ -1,46 +1,31 @@
-name: PipePipeMVP
+name: YourPipe
 options:
-  bundleIdPrefix: org.pipepipe
-packages:
-  KSPlayer:
-    url: https://github.com/kingslay/KSPlayer
-    exactVersion: 2.1.2
+  minimumXcodeGenVersion: 2.38.0
+  deploymentTarget:
+    iOS: 16.0
+settings:
+  base:
+    SWIFT_VERSION: 5.0
+    CURRENT_PROJECT_VERSION: 1
+    MARKETING_VERSION: 1.0
 targets:
-  PipePipeMVP:
+  YourPipe:
     type: application
     platform: iOS
-    deploymentTarget: "16.0"
     sources:
-      - PipePipeMVP
+      - path: YourPipe
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: org.pipepipe.mvp
-        INFOPLIST_FILE: PipePipeMVP/Info.plist
-        SWIFT_VERSION: 5.0
-        TARGETED_DEVICE_FAMILY: "1,2"
-        SUPPORTS_MACCATALYST: NO
-    dependencies:
-      - package: KSPlayer
-        product: KSPlayer
-    postBuildScripts:
-      - name: Fix KSPlayer Framework Bundle ID
-        script: |
-          FIXED_BUNDLE_ID="com.kintan.ksplayer.libshaderccombined"
-          FRAMEWORK_PATH="${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}/libshaderc_combined.framework"
-          PLIST_PATH="${FRAMEWORK_PATH}/Info.plist"
-          if [ ! -f "${PLIST_PATH}" ]; then
-            exit 0
-          fi
-
-          /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier ${FIXED_BUNDLE_ID}" "${PLIST_PATH}" || \
-          /usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string ${FIXED_BUNDLE_ID}" "${PLIST_PATH}"
-
-          if [ -n "${EXPANDED_CODE_SIGN_IDENTITY}" ]; then
-            /usr/bin/codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY}" \
-              --identifier "${FIXED_BUNDLE_ID}" \
-              --preserve-metadata=entitlements "${FRAMEWORK_PATH}"
-          fi
-
-          exit 0
-    scheme:
-      testTargets: []
+        PRODUCT_BUNDLE_IDENTIFIER: com.yourpipe.app
+        INFOPLIST_FILE: YourPipe/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        DEVELOPMENT_ASSET_PATHS: '"YourPipe/Preview Content"'
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        INFOPLIST_KEY_UIRequiresFullScreen: YES
+        INFOPLIST_KEY_LSRequiresIPhoneOS: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: UIInterfaceOrientationPortrait
+        CODE_SIGN_STYLE: Automatic
+        TARGETED_DEVICE_FAMILY: "1"
