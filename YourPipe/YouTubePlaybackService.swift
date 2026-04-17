@@ -199,9 +199,7 @@ actor YouTubePlaybackService {
     /// Appends `pot=<token>` to a stream URL if the provider yields one.
     /// No-op when no provider is installed — stays a safe passthrough.
     private func addingPoTokenIfAvailable(to url: URL, videoId: String) async -> URL {
-        guard let provider = poTokenProvider else { return url }
-        guard let token = await provider.poToken(visitorData: visitorData, videoId: videoId),
-              !token.isEmpty else { return url }
+        guard let token = await currentPoToken(for: videoId), !token.isEmpty else { return url }
         guard var comps = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return url }
         var items = comps.queryItems ?? []
         if let idx = items.firstIndex(where: { $0.name == "pot" }) {
@@ -211,6 +209,32 @@ actor YouTubePlaybackService {
         }
         comps.queryItems = items
         return comps.url ?? url
+    }
+
+    /// Returns the provider's current token for a video, or nil. Centralised
+    /// so both stream-URL and InnerTube-body paths share one lookup per
+    /// resolve (providers typically cache internally, so the second call is
+    /// cheap, but we avoid double-logging etc.)
+    private func currentPoToken(for videoId: String) async -> String? {
+        guard let provider = poTokenProvider else { return nil }
+        return await provider.poToken(visitorData: visitorData, videoId: videoId)
+    }
+
+    /// Builds the InnerTube `/player` payload. Centralising this keeps the
+    /// three resolve methods in sync when fields are added (poToken, params,
+    /// playbackContext, etc.).
+    private func buildPlayerPayload(videoId: String, clientCtx: [String: Any]) async -> [String: Any] {
+        var payload: [String: Any] = [
+            "context": ["client": clientCtx, "user": ["lockedSafetyMode": false]],
+            "videoId": videoId,
+            "cpn": randomCPN(),
+            "contentCheckOk": true,
+            "racyCheckOk": true
+        ]
+        if let token = await currentPoToken(for: videoId), !token.isEmpty {
+            payload["serviceIntegrityDimensions"] = ["poToken": token]
+        }
+        return payload
     }
 
     /// Ensures `visitorData` is available before first resolve. Lazy: called from
@@ -295,13 +319,7 @@ actor YouTubePlaybackService {
         ]
         if let vd = visitorData { clientCtx["visitorData"] = vd }
 
-        let payload: [String: Any] = [
-            "context": ["client": clientCtx, "user": ["lockedSafetyMode": false]],
-            "videoId": videoId,
-            "cpn": randomCPN(),
-            "contentCheckOk": true,
-            "racyCheckOk": true
-        ]
+        let payload = await buildPlayerPayload(videoId: videoId, clientCtx: clientCtx)
         req.httpBody = try JSONSerialization.data(withJSONObject: payload)
 
         let root = try await fetchPlayerRoot(request: req, client: iosClientName)
@@ -376,13 +394,7 @@ actor YouTubePlaybackService {
         ]
         if let vd = visitorData { clientCtx["visitorData"] = vd }
 
-        let payload: [String: Any] = [
-            "context": ["client": clientCtx, "user": ["lockedSafetyMode": false]],
-            "videoId": videoId,
-            "cpn": randomCPN(),
-            "contentCheckOk": true,
-            "racyCheckOk": true
-        ]
+        let payload = await buildPlayerPayload(videoId: videoId, clientCtx: clientCtx)
         req.httpBody = try JSONSerialization.data(withJSONObject: payload)
 
         let root = try await fetchPlayerRoot(request: req, client: vrClientName)
@@ -455,13 +467,7 @@ actor YouTubePlaybackService {
         ]
         if let vd = visitorData { clientCtx["visitorData"] = vd }
 
-        let payload: [String: Any] = [
-            "context": ["client": clientCtx, "user": ["lockedSafetyMode": false]],
-            "videoId": videoId,
-            "cpn": randomCPN(),
-            "contentCheckOk": true,
-            "racyCheckOk": true
-        ]
+        let payload = await buildPlayerPayload(videoId: videoId, clientCtx: clientCtx)
         req.httpBody = try JSONSerialization.data(withJSONObject: payload)
 
         let root = try await fetchPlayerRoot(request: req, client: androidClientName)
@@ -634,8 +640,61 @@ actor YouTubePlaybackService {
     }
 
     private func resolveURL(from item: [String: Any], playerId: String?) async -> URL? {
-        guard let urlStr = item["url"] as? String, let url = URL(string: urlStr) else { return nil }
-        return await decodeThrottlingIfNeeded(url: url, playerId: playerId)
+        if let urlStr = item["url"] as? String, let url = URL(string: urlStr) {
+            return await decodeThrottlingIfNeeded(url: url, playerId: playerId)
+        }
+        if let url = await resolveCipheredURL(from: item, playerId: playerId) {
+            return await decodeThrottlingIfNeeded(url: url, playerId: playerId)
+        }
+        return nil
+    }
+
+    /// Decodes a `signatureCipher` (or legacy `cipher`) blob into a playable
+    /// URL by routing the `s` value through PipePipe's remote sig decoder.
+    /// Falls back to nil on any failure — the caller simply tries the next
+    /// format.
+    private func resolveCipheredURL(from item: [String: Any], playerId: String?) async -> URL? {
+        guard let playerId else { return nil }
+        let raw = (item["signatureCipher"] as? String) ?? (item["cipher"] as? String)
+        guard let raw, !raw.isEmpty else { return nil }
+
+        var parts: [String: String] = [:]
+        for pair in raw.split(separator: "&") {
+            let kv = pair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard kv.count == 2 else { continue }
+            let key = String(kv[0])
+            let value = String(kv[1]).removingPercentEncoding ?? String(kv[1])
+            parts[key] = value
+        }
+        guard let urlStr = parts["url"], let baseURL = URL(string: urlStr) else { return nil }
+        guard let encodedSig = parts["s"], !encodedSig.isEmpty else {
+            // No signature to decode — URL is already playable as-is.
+            return baseURL
+        }
+        let sigParam = parts["sp"] ?? "signature"
+
+        do {
+            let decodedSig = try await PipePipeDecoderClient.shared.decodeSig(
+                playerId: playerId,
+                value: encodedSig
+            )
+            guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
+                return baseURL
+            }
+            var items = components.queryItems ?? []
+            if let i = items.firstIndex(where: { $0.name == sigParam }) {
+                items[i].value = decodedSig
+            } else {
+                items.append(URLQueryItem(name: sigParam, value: decodedSig))
+            }
+            components.queryItems = items
+            return components.url ?? baseURL
+        } catch {
+#if DEBUG
+            print("[SigDecoder] failed: \(error.localizedDescription) — skipping ciphered format")
+#endif
+            return nil
+        }
     }
 
     // MARK: - n-param throttling — local JavaScript decoder
@@ -664,8 +723,18 @@ actor YouTubePlaybackService {
     }
 
     private func decodeNParam(_ n: String, playerId: String) async throws -> String {
-        let funcBody = try await getNDecoderFunction(playerId: playerId)
-        return try runInJS(funcBody: funcBody, input: n)
+        // Primary path: remote PipePipe decoder. If it fails (network,
+        // schema change, etc.) fall back to local JavaScriptCore so playback
+        // stays resilient to single-source outages.
+        do {
+            return try await PipePipeDecoderClient.shared.decodeN(playerId: playerId, value: n)
+        } catch {
+#if DEBUG
+            print("[NDecoder] remote decode failed (\(error.localizedDescription)) — falling back to local JS")
+#endif
+            let funcBody = try await getNDecoderFunction(playerId: playerId)
+            return try runInJS(funcBody: funcBody, input: n)
+        }
     }
 
     private func getNDecoderFunction(playerId: String) async throws -> String {

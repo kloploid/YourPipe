@@ -3,7 +3,7 @@
 	archiveVersion = 1;
 	classes = {
 	};
-	objectVersion = 63;
+	objectVersion = 77;
 	objects = {
 
 /* Begin PBXBuildFile section */
@@ -23,10 +23,12 @@
 		C8AF736F8C29401355B52EA8 /* YouTubeSearchModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6270D5381961FFEB0ECA0147 /* YouTubeSearchModels.swift */; };
 		D54B9932B161DA6B14D83E24 /* YouTubeSearchService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5674F333091F43153657940E /* YouTubeSearchService.swift */; };
 		D9BA419A9729ED1319927F97 /* NewVideosViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 24FD54020159337F818EF103 /* NewVideosViewModel.swift */; };
+		F38430D02B7F5302975E9EDF /* PipePipeDecoderClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1E7A76F1FDEB617A0772EA43 /* PipePipeDecoderClient.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		1E07164A301E8AADE637B3BE /* SubscriptionStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SubscriptionStore.swift; sourceTree = "<group>"; };
+		1E7A76F1FDEB617A0772EA43 /* PipePipeDecoderClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PipePipeDecoderClient.swift; sourceTree = "<group>"; };
 		22E47AFF1E6E6D32A4657440 /* AppSettingsStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSettingsStore.swift; sourceTree = "<group>"; };
 		24FD54020159337F818EF103 /* NewVideosViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NewVideosViewModel.swift; sourceTree = "<group>"; };
 		34388516DEBC7761A5750A24 /* YourPipeApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = YourPipeApp.swift; sourceTree = "<group>"; };
@@ -37,7 +39,7 @@
 		61DBA9E455D42E3917989E99 /* PlaybackResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackResolver.swift; sourceTree = "<group>"; };
 		6270D5381961FFEB0ECA0147 /* YouTubeSearchModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = YouTubeSearchModels.swift; sourceTree = "<group>"; };
 		8D8037F9E91B5A18423B067C /* PlayerSurfaceView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerSurfaceView.swift; sourceTree = "<group>"; };
-		9137F60E86CDEA84BE7AE911 /* YourPipe.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = YourPipe.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		9137F60E86CDEA84BE7AE911 /* YourPipe.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = YourPipe.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		AF5D4C97EB6993D62B6D65B2 /* VideoPlaybackScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoPlaybackScreen.swift; sourceTree = "<group>"; };
 		BCBD0D7FCD7CA7B871237220 /* PlaybackController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackController.swift; sourceTree = "<group>"; };
 		C3C82A9E0B6B60BBAB22FD2C /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
@@ -72,6 +74,7 @@
 				EC62CE928B7CD500DA8CF74D /* HLSProxy.swift */,
 				E19281EF564427E6F0DDEA7B /* Info.plist */,
 				24FD54020159337F818EF103 /* NewVideosViewModel.swift */,
+				1E7A76F1FDEB617A0772EA43 /* PipePipeDecoderClient.swift */,
 				BCBD0D7FCD7CA7B871237220 /* PlaybackController.swift */,
 				61DBA9E455D42E3917989E99 /* PlaybackResolver.swift */,
 				8D8037F9E91B5A18423B067C /* PlayerSurfaceView.swift */,
@@ -123,7 +126,7 @@
 			isa = PBXProject;
 			attributes = {
 				BuildIndependentTargetsInParallel = YES;
-				LastUpgradeCheck = 2640;
+				LastUpgradeCheck = 1430;
 				TargetAttributes = {
 					CA8F95520F958BAE6E8334C1 = {
 						ProvisioningStyle = Automatic;
@@ -140,6 +143,7 @@
 			);
 			mainGroup = 12F010CE47549E32E5C11A73;
 			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
@@ -169,6 +173,7 @@
 				60FCA8C89CBEB18FD42E1627 /* ContentView.swift in Sources */,
 				C5619DBBDBB5E12F00054E35 /* HLSProxy.swift in Sources */,
 				D9BA419A9729ED1319927F97 /* NewVideosViewModel.swift in Sources */,
+				F38430D02B7F5302975E9EDF /* PipePipeDecoderClient.swift in Sources */,
 				70136AAE16253F817E1D045E /* PlaybackController.swift in Sources */,
 				2947B92A3CC358058958E2A8 /* PlaybackResolver.swift in Sources */,
 				02A4CF3B6309F43FBE2E65FA /* PlayerSurfaceView.swift in Sources */,
@@ -223,7 +228,6 @@
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
-				ENABLE_USER_SCRIPT_SANDBOXING = YES;
 				GCC_C_LANGUAGE_STANDARD = gnu11;
 				GCC_DYNAMIC_NO_PIC = NO;
 				GCC_NO_COMMON_BLOCKS = YES;
@@ -245,7 +249,6 @@
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = iphoneos;
-				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 				SWIFT_VERSION = 5.0;
@@ -315,7 +318,6 @@
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
-				ENABLE_USER_SCRIPT_SANDBOXING = YES;
 				GCC_C_LANGUAGE_STANDARD = gnu11;
 				GCC_NO_COMMON_BLOCKS = YES;
 				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
@@ -330,7 +332,6 @@
 				MTL_FAST_MATH = YES;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = iphoneos;
-				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_COMPILATION_MODE = wholemodule;
 				SWIFT_OPTIMIZATION_LEVEL = "-O";
 				SWIFT_VERSION = 5.0;
