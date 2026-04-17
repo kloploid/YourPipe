@@ -9,44 +9,95 @@ import JavaScriptCore
 //   github.com/TeamNewPipe/NewPipeExtractor — YoutubeStreamExtractor.java
 //   github.com/zerodytrash/YouTube-Internal-Clients
 
+/// Optional provider for YouTube's proof-of-origin token (poToken / "pot").
+/// When present, the service will:
+///   • include `serviceIntegrityDimensions.poToken` in the InnerTube payload
+///   • append `pot=<token>` to the resolved stream URL
+///
+/// NewPipeExtractor's `PoTokenProvider` fulfils the same role. A full
+/// implementation requires running YouTube's BotGuard challenge; this
+/// protocol exists so that capability can be plugged in later without
+/// changing call sites.
+protocol PoTokenProvider: AnyObject {
+    /// Returns a pot for the given (visitorData, videoId) pair, or nil if
+    /// unavailable. Implementations should cache aggressively — fresh tokens
+    /// are expensive to mint and remain valid for hours.
+    func poToken(visitorData: String?, videoId: String) async -> String?
+}
+
 actor YouTubePlaybackService {
     static let shared = YouTubePlaybackService()
 
+    /// Optional. When unset, pot is omitted entirely (today's default path).
+    /// Install via `setPoTokenProvider` once a concrete provider exists.
+    private weak var poTokenProvider: PoTokenProvider?
+
+    func setPoTokenProvider(_ provider: PoTokenProvider?) {
+        poTokenProvider = provider
+    }
+
     private let session: URLSession
 
-    // ── IOS client (primary — returns HLS, no PO token required) ─────────────
-    private let iosClientName    = "IOS"
-    private let iosClientVersion = "20.03.02"
-    private let iosClientNameInt = "5"
-    private let iosUserAgent     = "com.google.ios.youtube/20.03.02 (iPhone16,2; U; CPU iOS 18_2_1 like Mac OS X;)"
+    // Client fingerprints. Keep these in sync with upstream references:
+    //   • yt-dlp: yt_dlp/extractor/youtube/_base.py  (INNERTUBE_CLIENTS)
+    //   • NewPipeExtractor: extractor/services/youtube/YoutubeParsingHelper.java
+    // Outdated versions correlate with increased LOGIN_REQUIRED/403 rates.
 
-    // ── ANDROID_VR client (secondary — yt-dlp default, no PO token required) ─
+    // ── IOS client (returns HLS; no PO token required for most videos) ───────
+    private let iosClientName    = "IOS"
+    private let iosClientVersion = "20.11.6"
+    private let iosClientNameInt = "5"
+    private let iosUserAgent     = "com.google.ios.youtube/20.11.6 (iPhone16,2; U; CPU iOS 18_2_1 like Mac OS X;)"
+
+    // ── ANDROID_VR client (yt-dlp default — no PO token, direct MP4) ─────────
     private let vrClientName    = "ANDROID_VR"
-    private let vrClientVersion = "1.60.19"
+    private let vrClientVersion = "1.62.27"
     private let vrClientNameInt = "28"
     private let vrSdkVersion    = 32
-    private let vrUserAgent     = "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
+    private let vrUserAgent     = "com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
 
-    // ── ANDROID client (fallback — updated version) ───────────────────────────
+    // ── ANDROID client (fallback) ─────────────────────────────────────────────
     private let androidClientName    = "ANDROID"
-    private let androidClientVersion = "20.10.38"
+    private let androidClientVersion = "20.48.39"
     private let androidClientNameInt = "3"
     private let androidSdkVersion    = 34
-    private let androidUserAgent     = "com.google.android.youtube/20.10.38 (Linux; U; Android 14; en_US) gzip"
+    private let androidUserAgent     = "com.google.android.youtube/20.48.39 (Linux; U; Android 14; en_US) gzip"
 
     // Base InnerTube endpoint (no API key — avoids stale-key rejections)
     private let playerEndpoint = "https://youtubei.googleapis.com/youtubei/v1/player?prettyPrint=false"
 
-    // Cached visitor data (obtained once per session)
+    // Cached visitor data (obtained once per session, lazily)
     private var visitorData: String?
-    private var isFetchingVisitorData = false
+    private var visitorDataTask: Task<String?, Never>?
 
     // Local n-param decoder cache
     private var playerJSCache: [String: String] = [:]   // playerId → JS text
     private var nDecoderCache: [String: String] = [:]   // playerId → func body
 
+    // Per-client cooldowns and consecutive-failure counters for exponential
+    // backoff. A client is skipped entirely while cooled down; YouTube's
+    // rate-limiters otherwise escalate further (LOGIN_REQUIRED, harder bans).
+    private var clientCooldownUntil: [String: Date] = [:]
+    private var clientFailureStreak: [String: Int] = [:]
+
     private let nonceAlphabet = Array("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
     private let resolveTimeout: TimeInterval = 8
+
+    // Locale-derived client context. Using the device's real locale prevents a
+    // gl/hl=US mismatch with the user's IP, which raises the anti-bot signal.
+    private var localeHL: String {
+        Locale.current.language.languageCode?.identifier ?? "en"
+    }
+    private var localeGL: String {
+        Locale.current.region?.identifier ?? "US"
+    }
+    private var localeUTCOffsetMinutes: Int {
+        TimeZone.current.secondsFromGMT() / 60
+    }
+    private var acceptLanguageHeader: String {
+        let hl = localeHL, gl = localeGL
+        return "\(hl)-\(gl),\(hl);q=0.9,en;q=0.5"
+    }
 
     init(session: URLSession = .shared) {
         self.session = session
@@ -92,77 +143,93 @@ actor YouTubePlaybackService {
 
     // MARK: - Public API
 
-    /// Tries ANDROID_VR → ANDROID → IOS in order. First success wins.
+    /// Tries ANDROID_VR → ANDROID → IOS sequentially. First success wins.
+    /// Sequential (not parallel) — parallel resolve bursts to /player from one IP
+    /// look bot-like and correlate with increased 403/LOGIN_REQUIRED rates.
     func resolve(videoId: String, strategy: ResolveStrategy = .fastest) async throws -> PlaybackData {
-        startVisitorDataFetchIfNeeded()
+        await ensureVisitorData()
 
-        if case .exclude(let excludedClient) = strategy {
-            return try await resolveWithExcludedClient(videoId: videoId, excludedClient: excludedClient)
-        }
+        let excluded: String? = {
+            if case .exclude(let c) = strategy { return c } else { return nil }
+        }()
 
         var failures: [String] = []
-        if let result = await withTaskGroup(of: ClientAttempt.self, returning: PlaybackData?.self) { group in
-            group.addTask {
-                do {
-                    return .success(label: "ANDROID_VR", data: try await self.resolveViaAndroidVR(videoId: videoId))
-                } catch {
-                    return .failure(label: "ANDROID_VR", reason: error.localizedDescription)
-                }
-            }
-            group.addTask {
-                do {
-                    return .success(label: "ANDROID", data: try await self.resolveViaAndroid(videoId: videoId))
-                } catch {
-                    return .failure(label: "ANDROID", reason: error.localizedDescription)
-                }
-            }
 
-            while let attempt = await group.next() {
-                switch attempt {
-                case .success(let label, let data):
+        let attempts: [(label: String, run: () async throws -> PlaybackData)] = [
+            (vrClientName,      { try await self.resolveViaAndroidVR(videoId: videoId) }),
+            (androidClientName, { try await self.resolveViaAndroid(videoId: videoId) }),
+            (iosClientName,     { try await self.resolveViaIOS(videoId: videoId) }),
+        ]
+
+        for (idx, attempt) in attempts.enumerated() {
+            if excluded == attempt.label { continue }
+            if isCooledDown(client: attempt.label) {
+                failures.append("\(attempt.label): cooldown")
 #if DEBUG
-                    print("[YT] resolved via \(label) client")
+                print("[YT] \(attempt.label) skipped (cooldown active)")
 #endif
-                    group.cancelAll()
-                    return data
-                case .failure(let label, let reason):
-                    failures.append("\(label): \(reason)")
-                }
+                continue
             }
-            return nil
-        } {
-            return result
-        }
-
-        // 3. IOS client — last resort (can hit 403 on HLS segments for some videos/IPs).
+            if idx > 0 { try? await jitterSleep() }
+            do {
+                let data = try await attempt.run()
+                clearCooldown(client: attempt.label)
 #if DEBUG
-        if !failures.isEmpty {
-            print("[YT] primary clients failed: \(failures.joined(separator: " | "))")
-        }
-        print("[YT] falling back to IOS client")
+                print("[YT] resolved via \(attempt.label) client")
 #endif
-        return try await resolveViaIOS(videoId: videoId)
-    }
-
-    func warmup() {
-        startVisitorDataFetchIfNeeded()
-    }
-
-    private func startVisitorDataFetchIfNeeded() {
-        guard visitorData == nil, !isFetchingVisitorData else { return }
-        isFetchingVisitorData = true
-
-        Task {
-            let fetched = await self.fetchVisitorData()
-            self.finishVisitorDataFetch(fetched)
+                return data
+            } catch {
+                failures.append("\(attempt.label): \(error.localizedDescription)")
+#if DEBUG
+                print("[YT] \(attempt.label) failed: \(error.localizedDescription)")
+#endif
+            }
         }
+
+        throw PlaybackError.notPlayable(failures.joined(separator: " | "))
     }
 
-    private func finishVisitorDataFetch(_ fetched: String?) {
-        if visitorData == nil {
-            visitorData = fetched
+    /// Small randomised gap (120–280 ms) between sequential client attempts — softens
+    /// the "3 identical POSTs in 50ms" signature that rate-limiters pick up on.
+    private func jitterSleep() async throws {
+        let ms = UInt64.random(in: 120...280)
+        try await Task.sleep(nanoseconds: ms * 1_000_000)
+    }
+
+    /// Appends `pot=<token>` to a stream URL if the provider yields one.
+    /// No-op when no provider is installed — stays a safe passthrough.
+    private func addingPoTokenIfAvailable(to url: URL, videoId: String) async -> URL {
+        guard let provider = poTokenProvider else { return url }
+        guard let token = await provider.poToken(visitorData: visitorData, videoId: videoId),
+              !token.isEmpty else { return url }
+        guard var comps = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return url }
+        var items = comps.queryItems ?? []
+        if let idx = items.firstIndex(where: { $0.name == "pot" }) {
+            items[idx].value = token
+        } else {
+            items.append(URLQueryItem(name: "pot", value: token))
         }
-        isFetchingVisitorData = false
+        comps.queryItems = items
+        return comps.url ?? url
+    }
+
+    /// Ensures `visitorData` is available before first resolve. Lazy: called from
+    /// resolve(), not from app start, so we don't emit a cold-start request that
+    /// YouTube can fingerprint as "app just launched, no user action yet".
+    /// Deduplicates concurrent callers via a shared Task.
+    private func ensureVisitorData() async {
+        if visitorData != nil { return }
+        if let inflight = visitorDataTask {
+            _ = await inflight.value
+            return
+        }
+        let task = Task<String?, Never> { [weak self] in
+            await self?.fetchVisitorData()
+        }
+        visitorDataTask = task
+        let fetched = await task.value
+        if visitorData == nil { visitorData = fetched }
+        visitorDataTask = nil
 #if DEBUG
         print("[YT] visitorData=\(visitorData ?? "nil")")
 #endif
@@ -186,7 +253,7 @@ actor YouTubePlaybackService {
                 "client": [
                     "clientName": iosClientName,
                     "clientVersion": iosClientVersion,
-                    "hl": "en", "gl": "US"
+                    "hl": localeHL, "gl": localeGL
                 ]
             ],
             "browseId": "FEwhat_to_watch"
@@ -224,7 +291,7 @@ actor YouTubePlaybackService {
             "deviceModel":   "iPhone16,2",
             "osName":        "iPhone",
             "osVersion":     "18.2.1.22D82",
-            "hl": "en", "gl": "US", "utcOffsetMinutes": 0
+            "hl": localeHL, "gl": localeGL, "utcOffsetMinutes": localeUTCOffsetMinutes
         ]
         if let vd = visitorData { clientCtx["visitorData"] = vd }
 
@@ -237,7 +304,7 @@ actor YouTubePlaybackService {
         ]
         req.httpBody = try JSONSerialization.data(withJSONObject: payload)
 
-        let root = try await fetchPlayerRoot(request: req)
+        let root = try await fetchPlayerRoot(request: req, client: iosClientName)
 
 #if DEBUG
         if let ps = root["playabilityStatus"] as? [String: Any] {
@@ -246,7 +313,7 @@ actor YouTubePlaybackService {
         logStreams(root: root)
 #endif
 
-        try checkPlayability(root: root)
+        try checkPlayability(root: root, client: iosClientName)
 
         let details   = root["videoDetails"] as? [String: Any]
         let title     = details?["title"] as? String
@@ -265,10 +332,11 @@ actor YouTubePlaybackService {
         if let hlsStr = streaming?["hlsManifestUrl"] as? String,
            let hlsURL = URL(string: hlsStr) {
             let decoded = await decodeThrottlingIfNeeded(url: hlsURL, playerId: playerId)
+            let final = await addingPoTokenIfAvailable(to: decoded, videoId: videoId)
 #if DEBUG
-            print("[YT/IOS] using HLS: \(decoded)")
+            print("[YT/IOS] using HLS: \(final)")
 #endif
-            return PlaybackData(streamURL: decoded, title: title, channelName: channel,
+            return PlaybackData(streamURL: final, title: title, channelName: channel,
                                 channelId: channelId, description: desc,
                                 headers: headers, playerId: playerId, resolvedClient: iosClientName)
         }
@@ -276,7 +344,8 @@ actor YouTubePlaybackService {
         // IOS sometimes returns adaptive formats instead of HLS
         let formats = streaming?["formats"] as? [[String: Any]] ?? []
         if let muxURL = await pickBestMuxedURL(from: formats, playerId: playerId, startupPreferred: true) {
-            return PlaybackData(streamURL: muxURL, title: title, channelName: channel,
+            let final = await addingPoTokenIfAvailable(to: muxURL, videoId: videoId)
+            return PlaybackData(streamURL: final, title: title, channelName: channel,
                                 channelId: channelId, description: desc,
                                 headers: headers, playerId: playerId, resolvedClient: iosClientName)
         }
@@ -303,7 +372,7 @@ actor YouTubePlaybackService {
             "clientName":       vrClientName,
             "clientVersion":    vrClientVersion,
             "androidSdkVersion": vrSdkVersion,
-            "hl": "en", "gl": "US", "utcOffsetMinutes": 0
+            "hl": localeHL, "gl": localeGL, "utcOffsetMinutes": localeUTCOffsetMinutes
         ]
         if let vd = visitorData { clientCtx["visitorData"] = vd }
 
@@ -316,7 +385,7 @@ actor YouTubePlaybackService {
         ]
         req.httpBody = try JSONSerialization.data(withJSONObject: payload)
 
-        let root = try await fetchPlayerRoot(request: req)
+        let root = try await fetchPlayerRoot(request: req, client: vrClientName)
 
 #if DEBUG
         if let ps = root["playabilityStatus"] as? [String: Any] {
@@ -325,7 +394,7 @@ actor YouTubePlaybackService {
         logStreams(root: root)
 #endif
 
-        try checkPlayability(root: root)
+        try checkPlayability(root: root, client: vrClientName)
 
         let details   = root["videoDetails"] as? [String: Any]
         let title     = details?["title"] as? String
@@ -344,7 +413,8 @@ actor YouTubePlaybackService {
         // Muxed MP4 first — direct URL, no HLS proxy, far less 403-prone
         let formats = streaming?["formats"] as? [[String: Any]] ?? []
         if !isLive, let muxURL = await pickBestMuxedURL(from: formats, playerId: playerId, startupPreferred: true) {
-            return PlaybackData(streamURL: muxURL, title: title, channelName: channel,
+            let final = await addingPoTokenIfAvailable(to: muxURL, videoId: videoId)
+            return PlaybackData(streamURL: final, title: title, channelName: channel,
                                 channelId: channelId, description: desc,
                                 headers: headers, playerId: playerId, resolvedClient: vrClientName)
         }
@@ -353,7 +423,8 @@ actor YouTubePlaybackService {
         if let hlsStr = streaming?["hlsManifestUrl"] as? String,
            let hlsURL = URL(string: hlsStr) {
             let decoded = await decodeThrottlingIfNeeded(url: hlsURL, playerId: playerId)
-            return PlaybackData(streamURL: decoded, title: title, channelName: channel,
+            let final = await addingPoTokenIfAvailable(to: decoded, videoId: videoId)
+            return PlaybackData(streamURL: final, title: title, channelName: channel,
                                 channelId: channelId, description: desc,
                                 headers: headers, playerId: playerId, resolvedClient: vrClientName)
         }
@@ -380,7 +451,7 @@ actor YouTubePlaybackService {
             "clientName":        androidClientName,
             "clientVersion":     androidClientVersion,
             "androidSdkVersion": androidSdkVersion,
-            "hl": "en", "gl": "US", "utcOffsetMinutes": 0
+            "hl": localeHL, "gl": localeGL, "utcOffsetMinutes": localeUTCOffsetMinutes
         ]
         if let vd = visitorData { clientCtx["visitorData"] = vd }
 
@@ -393,7 +464,7 @@ actor YouTubePlaybackService {
         ]
         req.httpBody = try JSONSerialization.data(withJSONObject: payload)
 
-        let root = try await fetchPlayerRoot(request: req)
+        let root = try await fetchPlayerRoot(request: req, client: androidClientName)
 
 #if DEBUG
         if let ps = root["playabilityStatus"] as? [String: Any] {
@@ -402,7 +473,7 @@ actor YouTubePlaybackService {
         logStreams(root: root)
 #endif
 
-        try checkPlayability(root: root)
+        try checkPlayability(root: root, client: androidClientName)
 
         let details   = root["videoDetails"] as? [String: Any]
         let title     = details?["title"] as? String
@@ -421,7 +492,8 @@ actor YouTubePlaybackService {
         // Muxed MP4 first — direct URL, no HLS proxy, far less 403-prone
         let formats = streaming?["formats"] as? [[String: Any]] ?? []
         if !isLive, let muxURL = await pickBestMuxedURL(from: formats, playerId: playerId, startupPreferred: true) {
-            return PlaybackData(streamURL: muxURL, title: title, channelName: channel,
+            let final = await addingPoTokenIfAvailable(to: muxURL, videoId: videoId)
+            return PlaybackData(streamURL: final, title: title, channelName: channel,
                                 channelId: channelId, description: desc,
                                 headers: headers, playerId: playerId, resolvedClient: androidClientName)
         }
@@ -430,7 +502,8 @@ actor YouTubePlaybackService {
         if let hlsStr = streaming?["hlsManifestUrl"] as? String,
            let hlsURL = URL(string: hlsStr) {
             let decoded = await decodeThrottlingIfNeeded(url: hlsURL, playerId: playerId)
-            return PlaybackData(streamURL: decoded, title: title, channelName: channel,
+            let final = await addingPoTokenIfAvailable(to: decoded, videoId: videoId)
+            return PlaybackData(streamURL: final, title: title, channelName: channel,
                                 channelId: channelId, description: desc,
                                 headers: headers, playerId: playerId, resolvedClient: androidClientName)
         }
@@ -440,10 +513,14 @@ actor YouTubePlaybackService {
 
     // MARK: - Shared request helper
 
-    private func fetchPlayerRoot(request: URLRequest) async throws -> [String: Any] {
+    private func fetchPlayerRoot(request: URLRequest, client: String) async throws -> [String: Any] {
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw PlaybackError.invalidResponse }
         guard (200...299).contains(http.statusCode) else {
+            if http.statusCode == 403 || http.statusCode == 429 {
+                let retryAfter = (http.value(forHTTPHeaderField: "Retry-After") as NSString?)?.doubleValue ?? 0
+                applyCooldown(client: client, minSeconds: retryAfter)
+            }
             throw PlaybackError.httpStatus(http.statusCode, String(data: data, encoding: .utf8) ?? "")
         }
         guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -452,13 +529,57 @@ actor YouTubePlaybackService {
         return root
     }
 
-    private func checkPlayability(root: [String: Any]) throws {
+    // MARK: - Cooldown / backoff
+
+    private func isCooledDown(client: String) -> Bool {
+        guard let until = clientCooldownUntil[client] else { return false }
+        if until <= Date() {
+            clientCooldownUntil[client] = nil
+            return false
+        }
+        return true
+    }
+
+    private func applyCooldown(client: String, minSeconds: Double = 0) {
+        let streak = (clientFailureStreak[client] ?? 0) + 1
+        clientFailureStreak[client] = streak
+        // 2s, 4s, 8s, 16s, … capped at 5 min. Jitter ±15%.
+        let base = min(pow(2.0, Double(streak)), 300)
+        let jitter = Double.random(in: 0.85...1.15)
+        let delay = max(minSeconds, base * jitter)
+        clientCooldownUntil[client] = Date().addingTimeInterval(delay)
+#if DEBUG
+        print("[YT] cooldown \(client) for \(Int(delay))s (streak=\(streak))")
+#endif
+    }
+
+    private func clearCooldown(client: String) {
+        clientFailureStreak[client] = 0
+        clientCooldownUntil[client] = nil
+    }
+
+    private func checkPlayability(root: [String: Any], client: String) throws {
         guard let ps = root["playabilityStatus"] as? [String: Any],
               let status = ps["status"] as? String else { return }
         guard status == "OK" else {
             let reason = ps["reason"] as? String ?? status
+            // Certain statuses indicate anti-bot / rate-limit reactions from
+            // YouTube rather than a per-video restriction. Cooling down the
+            // client avoids hammering the same fingerprint and makes the
+            // failure "visible" to the waterfall so the next client runs.
+            if isAntiBotStatus(status: status, reason: reason) {
+                applyCooldown(client: client)
+            }
             throw PlaybackError.notPlayable(reason)
         }
+    }
+
+    private func isAntiBotStatus(status: String, reason: String) -> Bool {
+        if status == "LOGIN_REQUIRED" { return true }
+        let r = reason.lowercased()
+        return r.contains("sign in to confirm")
+            || r.contains("not a bot")
+            || r.contains("unusual traffic")
     }
 
     // MARK: - Stream selection
@@ -740,7 +861,7 @@ actor YouTubePlaybackService {
               let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
               match.numberOfRanges > 1,
               let range = Range(match.range(at: 1), in: text) else { return nil }
-        return String(String(text[range]).prefix(8))
+        return String(text[range])
     }
 
     private func requiresNDecoding(in streaming: [String: Any]?) -> Bool {
@@ -776,7 +897,7 @@ actor YouTubePlaybackService {
             "User-Agent":      iosUserAgent,
             "Origin":          "https://www.youtube.com",
             "Referer":         "https://www.youtube.com/watch?v=\(videoId)",
-            "Accept-Language": "en-US,en;q=0.9"
+            "Accept-Language": acceptLanguageHeader
         ]
         if let vd = visitorData { h["X-Goog-Visitor-Id"] = vd }
         return h
@@ -787,30 +908,12 @@ actor YouTubePlaybackService {
             "User-Agent":      userAgent,
             "Origin":          "https://www.youtube.com",
             "Referer":         "https://www.youtube.com/watch?v=\(videoId)",
-            "Accept-Language": "en-US,en;q=0.9"
+            "Accept-Language": acceptLanguageHeader
         ]
         if let vd = visitorData { h["X-Goog-Visitor-Id"] = vd }
         return h
     }
 
-    private func resolveWithExcludedClient(videoId: String, excludedClient: String) async throws -> PlaybackData {
-        var failures: [String] = []
-
-        if excludedClient != vrClientName {
-            do { return try await resolveViaAndroidVR(videoId: videoId) }
-            catch { failures.append("\(vrClientName): \(error.localizedDescription)") }
-        }
-        if excludedClient != androidClientName {
-            do { return try await resolveViaAndroid(videoId: videoId) }
-            catch { failures.append("\(androidClientName): \(error.localizedDescription)") }
-        }
-        if excludedClient != iosClientName {
-            do { return try await resolveViaIOS(videoId: videoId) }
-            catch { failures.append("\(iosClientName): \(error.localizedDescription)") }
-        }
-
-        throw PlaybackError.notPlayable(failures.joined(separator: " | "))
-    }
 }
 
 // MARK: - Debug logging
@@ -831,8 +934,3 @@ private extension YouTubePlaybackService {
     }
 }
 #endif
-
-private enum ClientAttempt {
-    case success(label: String, data: YouTubePlaybackService.PlaybackData)
-    case failure(label: String, reason: String)
-}

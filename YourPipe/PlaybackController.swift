@@ -57,6 +57,8 @@ final class PlaybackController: NSObject, ObservableObject {
     private var attemptedPipedRecoveryForVideoId: String?
     private var isRecoveringViaPiped = false
     private let pipedAutoFallbackEnabled = false
+    private var attemptedStreamRefreshForVideoId: String?
+    private var isRefreshingStream = false
     private var startupMetrics: StartupMetrics?
     private var firstFrameObserverToken: Any?
     private var readyWatchdogTask: Task<Void, Never>?
@@ -139,6 +141,8 @@ final class PlaybackController: NSObject, ObservableObject {
         activeSourceLabel = nil
         attemptedPipedRecoveryForVideoId = nil
         isRecoveringViaPiped = false
+        attemptedStreamRefreshForVideoId = nil
+        isRefreshingStream = false
         startupRetryAttemptedForVideoId = nil
         startupStreamSignature = nil
         startupMetrics = StartupMetrics(videoId: videoId)
@@ -267,6 +271,8 @@ final class PlaybackController: NSObject, ObservableObject {
         activeSourceLabel = nil
         attemptedPipedRecoveryForVideoId = nil
         isRecoveringViaPiped = false
+        attemptedStreamRefreshForVideoId = nil
+        isRefreshingStream = false
         startupMetrics = nil
         startupRetryAttemptedForVideoId = nil
         startupStreamSignature = nil
@@ -412,7 +418,10 @@ final class PlaybackController: NSObject, ObservableObject {
                 Task { @MainActor in
                     self.errorMessage = "Поток AVPlayer недоступен (\(domain):\(code)) \(reason)"
                     print("[VideoPlayback] AVPlayer failed domain=\(domain) code=\(code) reason=\(reason) underlying=\(underlyingDesc)")
-                    await self.recoverViaPipedIfNeeded(triggerError: nsError, underlying: underlying)
+                    let refreshed = await self.refreshStreamIfNeeded(triggerError: nsError, underlying: underlying)
+                    if !refreshed {
+                        await self.recoverViaPipedIfNeeded(triggerError: nsError, underlying: underlying)
+                    }
                 }
             }
         }
@@ -439,6 +448,72 @@ final class PlaybackController: NSObject, ObservableObject {
         guard let token = firstFrameObserverToken else { return }
         player?.removeTimeObserver(token)
         firstFrameObserverToken = nil
+    }
+
+    /// First-line recovery for 403/forbidden errors mid-playback: YouTube stream
+    /// URLs can be revoked under rate-limit, but a fresh resolve with the same
+    /// mode usually returns a working URL. We seek back to the last position
+    /// so the user doesn't visibly jump. Runs before Piped fallback.
+    /// Returns true if a refresh was attempted.
+    @discardableResult
+    private func refreshStreamIfNeeded(triggerError: NSError?, underlying: NSError?) async -> Bool {
+        guard !isRefreshingStream else { return true }
+        guard let videoId = currentVideoId else { return false }
+        guard attemptedStreamRefreshForVideoId != videoId else { return false }
+        guard shouldRetryWithPiped(triggerError: triggerError, underlying: underlying) else { return false }
+
+        attemptedStreamRefreshForVideoId = videoId
+        isRefreshingStream = true
+        isLoading = true
+        let resumeAt = player?.currentTime() ?? .zero
+
+        defer {
+            isRefreshingStream = false
+            isLoading = false
+        }
+
+        do {
+            let playback = try await resolver.resolve(
+                videoId: videoId,
+                mode: settings.playbackSourceMode,
+                forceRefresh: true
+            )
+            let newSignature = streamSignature(for: playback.streamURL)
+            if newSignature == startupStreamSignature {
+#if DEBUG
+                print("[VideoPlayback] stream refresh returned identical signature, skipping")
+#endif
+                return false
+            }
+            startupStreamSignature = newSignature
+            currentPlayerId = playback.playerId
+            activeSourceLabel = playback.sourceLabel
+            let item = makePlayerItem(url: playback.streamURL, headers: playback.headers, playerId: playback.playerId)
+            observe(item: item)
+            player?.pause()
+            removeFirstFrameObserverIfNeeded()
+            let newPlayer = AVPlayer(playerItem: item)
+            newPlayer.automaticallyWaitsToMinimizeStalling = false
+            player = newPlayer
+            attachFirstFrameObserver(player: newPlayer, videoId: videoId)
+            ensureAudioSessionActive()
+            if resumeAt.seconds > 1 {
+                await newPlayer.seek(to: resumeAt, toleranceBefore: .zero, toleranceAfter: .zero)
+            }
+            newPlayer.playImmediately(atRate: 1.0)
+            isPlayingState = true
+            errorMessage = nil
+            updateNowPlayingInfo()
+#if DEBUG
+            print("[VideoPlayback] stream refreshed, resuming at \(Int(resumeAt.seconds))s")
+#endif
+            return true
+        } catch {
+#if DEBUG
+            print("[VideoPlayback] stream refresh failed: \(error.localizedDescription)")
+#endif
+            return false
+        }
     }
 
     private func recoverViaPipedIfNeeded(triggerError: NSError?, underlying: NSError?) async {
