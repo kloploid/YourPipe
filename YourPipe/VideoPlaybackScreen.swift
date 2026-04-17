@@ -146,6 +146,15 @@ private struct SystemPlayerView: UIViewControllerRepresentable {
         if #available(iOS 14.2, *) {
             controller.canStartPictureInPictureAutomaticallyFromInline = true
         }
+        // CRITICAL for the lock-screen Now Playing widget: AVPlayerViewController
+        // defaults to overwriting MPNowPlayingInfoCenter.default().nowPlayingInfo
+        // with minimal auto-generated metadata (no artwork, wrong command set).
+        // That auto-overwrite is precisely what makes the widget render with
+        // invisible transport icons — iOS draws the widget based on
+        // AVPlayerViewController's skeletal info, ignoring our full setup in
+        // PlaybackController. Turning this off lets our MPRemoteCommandCenter +
+        // MPNowPlayingInfoCenter configuration own the widget end-to-end.
+        controller.updatesNowPlayingInfoCenter = false
         return controller
     }
 

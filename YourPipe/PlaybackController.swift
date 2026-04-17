@@ -53,6 +53,19 @@ final class PlaybackController: NSObject, ObservableObject {
     private var isDeviceLocked = false
     private var artworkCache: [URL: MPMediaItemArtwork] = [:]
     private var currentArtwork: MPMediaItemArtwork?
+    /// Fallback artwork used while the real thumbnail is still loading.
+    /// iOS 17+ requires `MPMediaItemPropertyArtwork` to be present for the
+    /// Now Playing widget's transport icons to render — without it you get
+    /// tap regions but no glyphs.
+    private lazy var placeholderArtwork: MPMediaItemArtwork = {
+        let size = CGSize(width: 300, height: 300)
+        let renderer = UIGraphicsImageRenderer(size: size)
+        let image = renderer.image { ctx in
+            UIColor(white: 0.08, alpha: 1.0).setFill()
+            ctx.fill(CGRect(origin: .zero, size: size))
+        }
+        return MPMediaItemArtwork(boundsSize: size) { _ in image }
+    }()
     private var currentPlayerId: String?
     private var attemptedPipedRecoveryForVideoId: String?
     private var isRecoveringViaPiped = false
@@ -703,9 +716,15 @@ final class PlaybackController: NSObject, ObservableObject {
     private func ensureAudioSessionActive() {
         let session = AVAudioSession.sharedInstance()
         do {
+            // `.moviePlayback` is the AVAudioSession.Mode designed for apps
+            // that play movies / video-with-audio. It tells iOS to route the
+            // Now Playing widget through the video-player variant, which
+            // reliably renders transport icons. `.default` leaves the
+            // widget's icon rendering in an ambiguous state on some iOS
+            // builds (tap regions present, glyphs missing).
             try session.setCategory(
                 .playback,
-                mode: .default
+                mode: .moviePlayback
             )
             try session.setActive(true)
 #if DEBUG
@@ -741,10 +760,12 @@ final class PlaybackController: NSObject, ObservableObject {
     }
 
     private func handleDeviceLock() {
+        // The app declares UIBackgroundModes = ["audio"], so audio must keep
+        // playing when the device locks. We only stop PiP (the video layer
+        // is suspended by the system anyway) and refresh Now Playing so the
+        // lock-screen widget stays in sync with the still-playing AVPlayer.
         isDeviceLocked = true
         stopPictureInPictureIfNeeded()
-        player?.pause()
-        isPlayingState = false
         updateNowPlayingInfo()
     }
 
@@ -757,26 +778,107 @@ final class PlaybackController: NSObject, ObservableObject {
         remoteCommandsConfigured = true
 
         let commandCenter = MPRemoteCommandCenter.shared()
-        commandCenter.playCommand.isEnabled = true
-        commandCenter.pauseCommand.isEnabled = true
-        commandCenter.togglePlayPauseCommand.isEnabled = true
 
+        // iOS 18+ widget rules:
+        // 1. Enabled commands with a registered target render icons in the
+        //    Now Playing widget. The widget picks its layout from the set of
+        //    enabled commands at the time playbackState first becomes
+        //    `.playing`.
+        // 2. Commands with a target but left at the default isEnabled value
+        //    sometimes render as tap-regions without glyphs (our previous
+        //    bug). Set isEnabled = true explicitly to lock in the layout.
+        // 3. Unused commands must be explicitly disabled — otherwise iOS
+        //    may reserve an empty slot in the widget and cannibalise the
+        //    space we need for play/pause.
+
+        commandCenter.playCommand.isEnabled = true
         commandCenter.playCommand.addTarget { [weak self] _ in
             guard let self else { return .commandFailed }
+            self.ensureAudioSessionActive()
             self.player?.play()
+            self.isPlayingState = true
             self.updateNowPlayingInfo()
             return .success
         }
+        commandCenter.pauseCommand.isEnabled = true
         commandCenter.pauseCommand.addTarget { [weak self] _ in
             guard let self else { return .commandFailed }
             self.player?.pause()
+            self.isPlayingState = false
             self.updateNowPlayingInfo()
             return .success
         }
+        commandCenter.togglePlayPauseCommand.isEnabled = true
         commandCenter.togglePlayPauseCommand.addTarget { [weak self] _ in
             guard let self else { return .commandFailed }
             self.togglePlayPause()
             return .success
+        }
+        commandCenter.changePlaybackPositionCommand.isEnabled = true
+        commandCenter.changePlaybackPositionCommand.addTarget { [weak self] event in
+            guard let self, let player = self.player,
+                  let positionEvent = event as? MPChangePlaybackPositionCommandEvent else {
+                return .commandFailed
+            }
+            let target = CMTime(seconds: positionEvent.positionTime, preferredTimescale: 600)
+            player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.updateNowPlayingInfo()
+                }
+            }
+            return .success
+        }
+
+        // Skip ±15s. Registering these makes iOS show the ±15 icons on
+        // the lock-screen widget instead of (unsupported) track navigation.
+        commandCenter.skipForwardCommand.preferredIntervals = [15]
+        commandCenter.skipForwardCommand.isEnabled = true
+        commandCenter.skipForwardCommand.addTarget { [weak self] event in
+            guard let self, let player = self.player,
+                  let skipEvent = event as? MPSkipIntervalCommandEvent else {
+                return .commandFailed
+            }
+            let now = player.currentTime().seconds
+            let target = CMTime(seconds: now + skipEvent.interval, preferredTimescale: 600)
+            player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.updateNowPlayingInfo()
+                }
+            }
+            return .success
+        }
+        commandCenter.skipBackwardCommand.preferredIntervals = [15]
+        commandCenter.skipBackwardCommand.isEnabled = true
+        commandCenter.skipBackwardCommand.addTarget { [weak self] event in
+            guard let self, let player = self.player,
+                  let skipEvent = event as? MPSkipIntervalCommandEvent else {
+                return .commandFailed
+            }
+            let now = player.currentTime().seconds
+            let target = CMTime(seconds: max(0, now - skipEvent.interval), preferredTimescale: 600)
+            player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.updateNowPlayingInfo()
+                }
+            }
+            return .success
+        }
+
+        // Explicitly disable commands we do NOT support — otherwise iOS 18
+        // may reserve widget real estate for them and end up with an empty
+        // slot instead of our play/pause button.
+        commandCenter.nextTrackCommand.isEnabled = false
+        commandCenter.previousTrackCommand.isEnabled = false
+        commandCenter.seekForwardCommand.isEnabled = false
+        commandCenter.seekBackwardCommand.isEnabled = false
+        commandCenter.changePlaybackRateCommand.isEnabled = false
+        commandCenter.ratingCommand.isEnabled = false
+        commandCenter.likeCommand.isEnabled = false
+        commandCenter.dislikeCommand.isEnabled = false
+        commandCenter.bookmarkCommand.isEnabled = false
+        if #available(iOS 14.0, *) {
+            commandCenter.changeRepeatModeCommand.isEnabled = false
+            commandCenter.changeShuffleModeCommand.isEnabled = false
         }
     }
 
@@ -797,29 +899,53 @@ final class PlaybackController: NSObject, ObservableObject {
     }
 
     private func updateNowPlayingInfo() {
+        let center = MPNowPlayingInfoCenter.default()
+
         guard currentVideoId != nil else {
-            MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+            center.nowPlayingInfo = nil
+            center.playbackState = .stopped
             return
         }
 
-        let elapsed = max(0, player?.currentTime().seconds ?? 0)
+        // Guard against NaN: `player.currentTime().seconds` returns NaN
+        // before the HLS manifest resolves. NaN inside `nowPlayingInfo` is a
+        // known cause of the widget rendering glyphless transport controls
+        // (tap regions present, icons missing).
+        let rawElapsed = player?.currentTime().seconds ?? 0
+        let elapsed = (rawElapsed.isFinite && rawElapsed >= 0) ? rawElapsed : 0
+
         var info: [String: Any] = [
             MPMediaItemPropertyTitle: title ?? "Без названия",
             MPMediaItemPropertyArtist: channelName ?? "Канал",
             MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? 1.0 : 0.0,
-            MPNowPlayingInfoPropertyElapsedPlaybackTime: elapsed
+            MPNowPlayingInfoPropertyElapsedPlaybackTime: elapsed,
+            MPNowPlayingInfoPropertyMediaType: MPNowPlayingInfoMediaType.audio.rawValue
         ]
 
-        if let duration = player?.currentItem?.duration.seconds,
-           duration.isFinite, duration > 0 {
-            info[MPMediaItemPropertyPlaybackDuration] = duration
+        if let rawDuration = player?.currentItem?.duration.seconds,
+           rawDuration.isFinite, rawDuration > 0 {
+            info[MPMediaItemPropertyPlaybackDuration] = rawDuration
         }
 
-        if let artwork = currentArtwork {
-            info[MPMediaItemPropertyArtwork] = artwork
-        }
+        // Artwork is required on iOS 17+ for the widget's transport icons
+        // to render. Use a placeholder until the real thumbnail loads.
+        info[MPMediaItemPropertyArtwork] = currentArtwork ?? placeholderArtwork
 
-        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+        center.nowPlayingInfo = info
+#if DEBUG
+        print("[NowPlaying] title=\(title ?? "-") rate=\(info[MPNowPlayingInfoPropertyPlaybackRate] ?? "-") elapsed=\(elapsed) duration=\(info[MPMediaItemPropertyPlaybackDuration] ?? "none") artwork=\(currentArtwork != nil ? "real" : "placeholder")")
+#endif
+
+        // iOS 13+ explicit playback state — the authoritative signal for
+        // the Now Playing widget. Update it unconditionally; the underlying
+        // setter is cheap and idempotent.
+        if player == nil {
+            center.playbackState = .stopped
+        } else if isPlaying {
+            center.playbackState = .playing
+        } else {
+            center.playbackState = .paused
+        }
     }
 
     private func loadArtworkIfNeeded() async {

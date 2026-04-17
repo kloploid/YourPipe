@@ -10,6 +10,13 @@ struct YourPipeApp: App {
     @StateObject private var subscriptions = SubscriptionStore()
 
     init() {
+        // CRITICAL ORDER for the lock-screen Now Playing widget on iOS 18+:
+        // `beginReceivingRemoteControlEvents()` must be called BEFORE we
+        // register MPRemoteCommandCenter targets. Otherwise iOS caches an
+        // empty command set at registration time and the widget renders with
+        // missing transport icons even though our handlers are attached.
+        UIApplication.shared.beginReceivingRemoteControlEvents()
+
         let settings = AppSettingsStore.shared
         _settings = StateObject(wrappedValue: settings)
         _playback = StateObject(wrappedValue: PlaybackController(settings: settings))
@@ -20,7 +27,6 @@ struct YourPipeApp: App {
             print("[App] UIBackgroundModes not set")
         }
 #endif
-        UIApplication.shared.beginReceivingRemoteControlEvents()
     }
 
     var body: some Scene {
